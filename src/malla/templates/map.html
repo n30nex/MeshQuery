@@ -1871,8 +1871,20 @@ async function refreshMapData() {
         // Apply filters and update display
         applyClientSideFilters();
 
-        // Restore map state
-        map.setView(currentCenter, currentZoom);
+        // Restore map state WITHOUT animation to prevent jitter
+        // Only restore if the user hasn't moved the map during the refresh
+        const newCenter = map.getCenter();
+        const newZoom = map.getZoom();
+        const centerMoved = Math.abs(newCenter.lat - currentCenter.lat) > 0.0001 || 
+                           Math.abs(newCenter.lng - currentCenter.lng) > 0.0001;
+        const zoomChanged = newZoom !== currentZoom;
+        
+        // Only restore view if it changed during data reload (e.g., from applyClientSideFilters)
+        // This prevents fighting with user pan/zoom actions
+        if (centerMoved || zoomChanged) {
+            map.setView(currentCenter, currentZoom, { animate: false });
+        }
+        
         selectedNodeId = currentSelectedNode;
         showTracerouteLinks = currentShowTraceroute;
         showPacketLinks = currentShowPacket;

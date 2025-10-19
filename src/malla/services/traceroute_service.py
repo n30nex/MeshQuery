@@ -493,123 +493,116 @@ class TracerouteService:
                 logger.error(f"Error getting single-hop links: {e}")
                 single_hop_links = []
 
-            # Get multi-hop links using direct query approach
+            # Get multi-hop links by summing hop segments (more accurate)
             multi_hop_links = []
             try:
                 from ..database.connection_postgres import (
                     get_postgres_connection,
                     get_postgres_cursor,
                 )
+                from ..utils.geo_utils import calculate_distance
 
                 conn = get_postgres_connection()
                 cursor = get_postgres_cursor(conn)
 
-                # Query traceroute hops directly to build multi-hop paths
-                # Note: We'll calculate distances in Python since traceroute_hops doesn't store distance_km
+                # Pull recent traceroute packets and reconstruct their hop lists
                 cursor.execute(
                     """
-                    WITH hop_sets AS (
-                        SELECT
-                            packet_id,
-                            MIN(from_node_id) FILTER (WHERE hop_index = 0) AS source_id,
-                            MAX(to_node_id) FILTER (WHERE hop_index = (SELECT MAX(h2.hop_index) FROM traceroute_hops h2 WHERE h2.packet_id = h.packet_id)) AS dest_id,
-                            MAX(snr) AS best_snr,
-                            MAX(timestamp) AS last_seen,
-                            COUNT(*) as hop_count,
-                            ARRAY_AGG(from_node_id ORDER BY hop_index) as hop_from_nodes,
-                            ARRAY_AGG(to_node_id ORDER BY hop_index) as hop_to_nodes
-                        FROM traceroute_hops h
-                        WHERE timestamp >= NOW() - MAKE_INTERVAL(hours => %s)
-                        GROUP BY packet_id
-                        HAVING COUNT(*) > 1  -- Only multi-hop paths
-                    )
                     SELECT
-                        source_id as from_node_id,
-                        dest_id as to_node_id,
-                        MAX(hop_count) as hop_count,
-                        MAX(best_snr) as avg_snr,
-                        MAX(last_seen) as last_seen,
-                        ARRAY_AGG(DISTINCT hop_from_nodes) as all_from_nodes,
-                        ARRAY_AGG(DISTINCT hop_to_nodes) as all_to_nodes
-                    FROM hop_sets
-                    WHERE source_id IS NOT NULL AND dest_id IS NOT NULL
-                    GROUP BY source_id, dest_id
-                    ORDER BY hop_count DESC, best_snr DESC NULLS LAST
+                        ph.id as packet_id,
+                        ph.timestamp,
+                        ph.from_node_id,
+                        ph.to_node_id,
+                        tr.hop_index,
+                        tr.from_node_id as hop_from,
+                        tr.to_node_id as hop_to,
+                        tr.snr
+                    FROM packet_history ph
+                    JOIN traceroute_hops tr ON tr.packet_id = ph.id
+                    WHERE ph.portnum_name = 'TRACEROUTE_APP'
+                      AND ph.timestamp >= EXTRACT(EPOCH FROM (NOW() - INTERVAL '7 days'))
+                    ORDER BY ph.id DESC, tr.hop_index ASC
                     LIMIT %s
-                """,
-                    (168, max_results),
+                    """,
+                    (max_results * 200,),
                 )
 
-                multi_hop_data = cursor.fetchall()
+                rows = cursor.fetchall()
                 conn.close()
 
-                logger.info(
-                    f"Retrieved {len(multi_hop_data)} multi-hop links from direct query"
-                )
+                # Group hops by packet and compute summed distances
+                from collections import defaultdict
+                hops_by_packet: dict[int, list] = defaultdict(list)
+                for r in rows:
+                    hops_by_packet[r[0]].append(r)
 
-                # Get node positions for distance calculations
-                from ..database.repositories import NodeRepository
-                from ..utils.geo_utils import calculate_distance
-                
-                node_ids_for_positions = set()
-                for link in multi_hop_data:
-                    node_ids_for_positions.add(link[0])  # from_node_id
-                    node_ids_for_positions.add(link[1])  # to_node_id
-                
-                # Fetch positions for all nodes
-                positions = {}
-                if node_ids_for_positions:
-                    from ..database.connection_postgres import get_postgres_connection, get_postgres_cursor
+                # Preload latest positions for nodes involved
+                node_ids = set()
+                for _, hop_rows in hops_by_packet.items():
+                    for r in hop_rows:
+                        node_ids.add(r[5])
+                        node_ids.add(r[6])
+
+                positions: dict[int, dict] = {}
+                if node_ids:
                     pos_conn = get_postgres_connection()
                     pos_cursor = get_postgres_cursor(pos_conn)
-                    
-                    pos_query = """
-                    SELECT DISTINCT ON (ph.from_node_id)
-                        ph.from_node_id,
-                        ph.raw_payload
-                    FROM packet_history ph
-                    WHERE ph.portnum = 3  -- POSITION_APP
-                    AND ph.raw_payload IS NOT NULL
-                    AND ph.from_node_id = ANY(%s)
-                    ORDER BY ph.from_node_id, ph.timestamp DESC
-                    """
-                    pos_cursor.execute(pos_query, (list(node_ids_for_positions),))
-                    position_results = pos_cursor.fetchall()
-                    pos_conn.close()
-                    
-                    # Parse positions from protobuf
-                    for pos_row in position_results:
+                    pos_cursor.execute(
+                        """
+                        SELECT DISTINCT ON (ph.from_node_id)
+                            ph.from_node_id,
+                            ph.raw_payload
+                        FROM packet_history ph
+                        WHERE ph.portnum = 3 AND ph.raw_payload IS NOT NULL
+                          AND ph.from_node_id = ANY(%s)
+                        ORDER BY ph.from_node_id, ph.timestamp DESC
+                        """,
+                        (list(node_ids),),
+                    )
+                    for pos_row in pos_cursor.fetchall():
                         try:
                             from meshtastic import mesh_pb2
                             position = mesh_pb2.Position()
-                            position.ParseFromString(pos_row["raw_payload"])
-                            
-                            if position.latitude_i != 0 and position.longitude_i != 0:
-                                positions[pos_row["from_node_id"]] = {
-                                    "latitude": position.latitude_i / 10000000.0,
-                                    "longitude": position.longitude_i / 10000000.0,
+                            position.ParseFromString(pos_row[1])
+                            if position.latitude_i and position.longitude_i:
+                                positions[pos_row[0]] = {
+                                    "lat": position.latitude_i / 1e7,
+                                    "lon": position.longitude_i / 1e7,
                                 }
-                        except Exception as e:
-                            logger.warning(f"Failed to parse position for node {pos_row['from_node_id']}: {e}")
+                        except Exception:
+                            continue
+                    pos_conn.close()
 
-                # Convert to the expected format with distance calculation
-                for link in multi_hop_data:
-                    from_node_id = link[0]
-                    to_node_id = link[1]
-                    hop_count = link[2] or 0
-                    avg_snr = link[3] or 0
-                    last_seen = link[4]
-                    
-                    # Calculate distance if positions are available
-                    total_distance_km = None
-                    if from_node_id in positions and to_node_id in positions:
-                        from_pos = positions[from_node_id]
-                        to_pos = positions[to_node_id]
-                        total_distance_km = calculate_distance(
-                            from_pos["latitude"], from_pos["longitude"],
-                            to_pos["latitude"], to_pos["longitude"]
-                        )
-                    
+                for packet_id, hop_rows in hops_by_packet.items():
+                    if not hop_rows:
+                        continue
+                    # Compute sum of segment distances
+                    total_distance = 0.0
+                    segment_count = 0
+                    min_snr = None
+                    max_snr = None
+                    for r in hop_rows:
+                        a = positions.get(r[5])
+                        b = positions.get(r[6])
+                        if a and b:
+                            total_distance += calculate_distance(a["lat"], a["lon"], b["lat"], b["lon"])
+                            segment_count += 1
+                        snr_val = r[7]
+                        if snr_val is not None:
+                            min_snr = snr_val if min_snr is None else min(min_snr, snr_val)
+                            max_snr = snr_val if max_snr is None else max(max_snr, snr_val)
+
+                    # If we have at least one measured segment, keep this path
+                    total_distance_km = total_distance if segment_count > 0 else None
+
+                    # Build entry keyed by end nodes
+                    from_node_id = hop_rows[0][2]
+                    to_node_id = hop_rows[-1][3]
+                    hop_count = len(hop_rows)
+                    avg_snr = None
+                    if min_snr is not None and max_snr is not None:
+                        avg_snr = (min_snr + max_snr) / 2.0
+
                     multi_hop_links.append(
                         {
                             "from_node_id": from_node_id,
@@ -617,14 +610,13 @@ class TracerouteService:
                             "total_distance_km": total_distance_km,
                             "hop_count": hop_count,
                             "avg_snr": avg_snr,
-                            "route_preview": [],  # Could be extracted from hop arrays if needed
-                            "last_seen": last_seen,
-                            "packet_id": 0,  # Not available in aggregate query
+                            "route_preview": [],
+                            "last_seen": hop_rows[-1][1],
+                            "packet_id": packet_id,
                         }
                     )
-
             except Exception as e:
-                logger.error(f"Error getting multi-hop links data: {e}")
+                logger.error(f"Error computing multi-hop distances: {e}")
                 multi_hop_links = []
 
             # Apply distance filter to multi-hop links (keep links with unknown distance or >= threshold)

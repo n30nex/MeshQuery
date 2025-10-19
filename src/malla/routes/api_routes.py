@@ -1786,6 +1786,9 @@ def api_packets_data():
             "page": page,
             "limit": limit,
             "total_pages": (result["total_count"] + limit - 1) // limit,
+            # Propagate backend hint so the frontend can enable "Next" for
+            # grouped/estimated queries even when total_pages is approximate.
+            "has_more": bool(result.get("has_more", False)),
         }
 
         return jsonify(response)
@@ -2164,6 +2167,8 @@ def api_traceroute_data():
             "page": page,
             "limit": limit,
             "total_pages": (result["total_count"] + limit - 1) // limit,
+            # Propagate backend hint for estimated/grouped queries
+            "has_more": bool(result.get("has_more", False)),
         }
 
         return jsonify(response)

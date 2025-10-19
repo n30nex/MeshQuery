@@ -180,6 +180,9 @@
     /**
      * Handle incoming packet events.  Dispatch from SSE via live_stream.js.
      * Updates statistics and triggers animation when appropriate.
+     * 
+     * Only animates DIRECT RF links (packets where hop_start == hop_limit or hop_count == 0)
+     * to avoid drawing impossible long-distance lines for multi-hop packets.
      */
     function handlePacketEvent(event) {
         if (!liveActive) return;
@@ -187,9 +190,44 @@
         const fromId = data.from_node_id || data.from;
         const toId = data.to_node_id || data.to;
         if (!fromId || !toId) return;
+        
+        // Only animate direct RF links to avoid impossible long-distance visualizations
+        // Check if this is a direct transmission (not a multi-hop packet)
+        const hopStart = data.hop_start;
+        const hopLimit = data.hop_limit;
+        const hopCount = data.hop_count;
+        
+        // Skip if this is a multi-hop packet (hop_start < hop_limit means it has hops remaining)
+        // or if hop_count > 0 (it has already hopped)
+        const isDirect = (hopStart !== undefined && hopLimit !== undefined && hopStart === hopLimit) ||
+                        (hopCount !== undefined && hopCount === 0) ||
+                        (hopStart === undefined && hopLimit === undefined && hopCount === undefined);
+        
+        if (!isDirect) {
+            // Still count the packet in statistics, but don't animate impossible links
+            packetCounter += 1;
+            packetsThisSecond += 1;
+            packetCounterEl.textContent = String(packetCounter);
+            totalPacketsEl.textContent = String(packetCounter);
+            return;
+        }
+        
         const fromNode = nodes[fromId];
         const toNode = nodes[toId];
         if (!fromNode || !toNode) return;
+        
+        // Calculate distance to filter out impossible RF links (> 800km is very unlikely for LoRa)
+        const distance = calculateDistance(fromNode.lat, fromNode.lng, toNode.lat, toNode.lng);
+        if (distance > 800) {
+            // This is likely a routing error or data issue, skip animation
+            console.warn(`Skipping impossible link: ${distance.toFixed(1)}km from ${fromNode.name} to ${toNode.name}`);
+            packetCounter += 1;
+            packetsThisSecond += 1;
+            packetCounterEl.textContent = String(packetCounter);
+            totalPacketsEl.textContent = String(packetCounter);
+            return;
+        }
+        
         // Record active nodes
         activeNodeIds.add(fromId);
         activeNodeIds.add(toId);
@@ -201,6 +239,21 @@
         // Update UI counters
         packetCounterEl.textContent = String(packetCounter);
         totalPacketsEl.textContent = String(packetCounter);
+    }
+    
+    /**
+     * Calculate great-circle distance between two points using Haversine formula.
+     * Returns distance in kilometers.
+     */
+    function calculateDistance(lat1, lon1, lat2, lon2) {
+        const R = 6371; // Earth's radius in km
+        const dLat = (lat2 - lat1) * Math.PI / 180;
+        const dLon = (lon2 - lon1) * Math.PI / 180;
+        const a = Math.sin(dLat/2) * Math.sin(dLat/2) +
+                 Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
+                 Math.sin(dLon/2) * Math.sin(dLon/2);
+        const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+        return R * c;
     }
 
     /**

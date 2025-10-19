@@ -249,18 +249,60 @@ class ModernTable {
                 }
             }
 
+            const requestedPage = this.state.page;
             const response = await fetch(`${this.options.endpoint}?${params}`);
             if (!response.ok) {
                 throw new Error(`HTTP ${response.status}: ${response.statusText}`);
             }
 
             const data = await response.json();
-            this.state.data = data.data || [];
-            this.state.totalCount = data.total_count || 0;
-            this.state.totalPages = Math.ceil(this.state.totalCount / this.state.pageSize);
+            const rows = Array.isArray(data.data) ? data.data : [];
+
+            const serverLimit = typeof data.limit === 'number' && !Number.isNaN(data.limit)
+                ? data.limit
+                : this.state.pageSize;
+            const serverPage = typeof data.page === 'number' && !Number.isNaN(data.page)
+                ? data.page
+                : requestedPage;
+            const totalCount = typeof data.total_count === 'number' && !Number.isNaN(data.total_count)
+                ? data.total_count
+                : rows.length;
+
+            let totalPages;
+            if (typeof data.total_pages === 'number' && !Number.isNaN(data.total_pages)) {
+                totalPages = data.total_pages;
+            } else {
+                const divisor = serverLimit || this.state.pageSize || 1;
+                totalPages = Math.ceil(totalCount / divisor);
+            }
+            if (totalPages < 1 && totalCount > 0) {
+                totalPages = 1;
+            }
+
+            this.state.pageSize = serverLimit || this.state.pageSize;
+            this.state.page = serverPage || requestedPage;
+            this.state.totalCount = totalCount;
+            this.state.totalPages = totalPages;
+            this.state.data = rows;
 
             // Track if this is a grouped query for pagination display
             this.state.isGrouped = params.get('group_packets') === 'true';
+
+            // Respect server-provided has_more hint for estimated/grouped queries
+            this.state.hasMore = Boolean(data.has_more);
+
+            if (this.state.totalPages > 0 && requestedPage > this.state.totalPages) {
+                // Requested page is now out of bounds (e.g. filters reduced the dataset) -- retry with the last page
+                this.state.page = this.state.totalPages;
+                this.state.loading = false;
+                return this.loadData();
+            }
+            if (this.state.data.length === 0 && this.state.totalCount > 0 && this.state.page > 1 && this.state.page <= this.state.totalPages) {
+                // Rare case: empty response for a valid page due to backend approximation. Retry with previous page.
+                this.state.page = Math.max(1, this.state.page - 1);
+                this.state.loading = false;
+                return this.loadData();
+            }
 
             this.renderTableBody();
             this.updatePagination();
@@ -443,7 +485,7 @@ class ModernTable {
         `);
 
         // For grouped queries with estimated counts, limit pagination display
-        if (this.state.isGrouped && this.state.data.length === this.state.pageSize) {
+        if (this.state.isGrouped && (this.state.hasMore || this.state.data.length === this.state.pageSize)) {
             // Show current page and next few pages only
             const maxDisplayPages = Math.min(totalPages, page + 5);
 
@@ -488,9 +530,9 @@ class ModernTable {
             }
         }
 
-        // Next button - for grouped queries, only disable if we got less than a full page
+        // Next button - for grouped queries, enable when the server hints there are more
         const hasNextPage = this.state.isGrouped ?
-            this.state.data.length === this.state.pageSize :
+            (this.state.hasMore || this.state.data.length === this.state.pageSize) :
             page < totalPages;
 
         buttons.push(`

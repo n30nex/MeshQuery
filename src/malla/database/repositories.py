@@ -2956,6 +2956,11 @@ class TracerouteRepository:
                 "limit": limit,
                 "offset": offset,
                 "is_grouped": group_packets,
+                # Hint to UI for grouped/estimated queries
+                "has_more": bool(
+                    (group_packets and len(packets) == limit)
+                    or (not group_packets and (offset + len(packets)) < total_count)
+                ),
             }
 
         except Exception as e:

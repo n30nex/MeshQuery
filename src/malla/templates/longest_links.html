@@ -66,6 +66,23 @@
     .background-refresh-notification.show {
         opacity: 1;
     }
+    .chart-wrapper {
+        position: relative;
+        height: 280px;
+    }
+    .chart-empty {
+        text-align: center;
+        color: #6c757d;
+        font-style: italic;
+        padding: 1rem 0;
+    }
+    .chart-meta {
+        font-size: 0.8rem;
+        color: #6c757d;
+    }
+    [data-bs-theme=dark] .chart-meta {
+        color: var(--bs-secondary-color);
+    }
 </style>
 {% endblock %}
 
@@ -117,6 +134,42 @@
             <div class="card-body">
                 <h4 id="longest-path" class="text-info">-</h4>
                 <small class="text-muted">Longest Path</small>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Charts -->
+<div class="row mb-4">
+    <div class="col-lg-6">
+        <div class="card analysis-card">
+            <div class="card-header d-flex justify-content-between align-items-center">
+                <h6 class="mb-0"><i class="bi bi-graph-up"></i> Direct Link Distances</h6>
+                <span class="chart-meta" id="direct-chart-count">Top 0</span>
+            </div>
+            <div class="card-body">
+                <div class="chart-wrapper">
+                    <canvas id="direct-distance-chart" aria-label="Direct link distance chart"></canvas>
+                </div>
+                <div class="chart-empty" id="direct-chart-empty" style="display: none;">
+                    No direct links with distance data available. Ensure nodes have recent position packets.
+                </div>
+            </div>
+        </div>
+    </div>
+    <div class="col-lg-6">
+        <div class="card analysis-card">
+            <div class="card-header d-flex justify-content-between align-items-center">
+                <h6 class="mb-0"><i class="bi bi-diagram-3"></i> Indirect Path Distances</h6>
+                <span class="chart-meta" id="indirect-chart-count">Top 0</span>
+            </div>
+            <div class="card-body">
+                <div class="chart-wrapper">
+                    <canvas id="indirect-distance-chart" aria-label="Indirect path distance chart"></canvas>
+                </div>
+                <div class="chart-empty" id="indirect-chart-empty" style="display: none;">
+                    No complete paths with distance data available.
+                </div>
             </div>
         </div>
     </div>
@@ -292,9 +345,10 @@
 {% endblock %}
 
 {% block extra_js %}
-<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 <script>
     let currentData = null;
+    let directLinksChart = null;
+    let indirectLinksChart = null;
 
     // Load data on page load
     document.addEventListener('DOMContentLoaded', function() {
@@ -412,6 +466,10 @@
 
         // Display indirect links
         displayIndirectLinks(data.indirect_links);
+
+        // Update charts
+        renderDirectLinksChart(data.direct_links);
+        renderIndirectLinksChart(data.indirect_links);
 
         // Update tab badges
         document.getElementById('direct-count').textContent = data.direct_links.length;
@@ -555,6 +613,240 @@
         });
 
         tableBody.innerHTML = html;
+    }
+
+    function renderDirectLinksChart(links) {
+        const canvas = document.getElementById('direct-distance-chart');
+        const emptyState = document.getElementById('direct-chart-empty');
+        const metaLabel = document.getElementById('direct-chart-count');
+        if (!canvas) return;
+
+        const ctx = canvas.getContext('2d');
+        const validLinks = (links || [])
+            .filter(link => typeof link.distance_km === 'number' && !Number.isNaN(link.distance_km))
+            .sort((a, b) => (b.distance_km || 0) - (a.distance_km || 0))
+            .slice(0, 10);
+
+        if (metaLabel) {
+            metaLabel.textContent = validLinks.length ? `Top ${validLinks.length}` : 'No data';
+        }
+
+        if (validLinks.length === 0) {
+            if (directLinksChart) {
+                directLinksChart.destroy();
+                directLinksChart = null;
+            }
+            canvas.style.display = 'none';
+            if (emptyState) emptyState.style.display = 'block';
+            return;
+        }
+
+        canvas.style.display = 'block';
+        if (emptyState) emptyState.style.display = 'none';
+
+        const labels = validLinks.map(link => {
+            const fromHex = link.from_node_id !== null && link.from_node_id !== undefined
+                ? link.from_node_id.toString(16).padStart(8, '0')
+                : 'unknown';
+            const toHex = link.to_node_id !== null && link.to_node_id !== undefined
+                ? link.to_node_id.toString(16).padStart(8, '0')
+                : 'unknown';
+            const from = link.from_node_name || `!${fromHex}`;
+            const to = link.to_node_name || `!${toHex}`;
+            return `${from} -> ${to}`;
+        });
+        const distances = validLinks.map(link => Number(link.distance_km.toFixed(2)));
+        const metadata = validLinks.map(link => ({
+            snr: typeof link.snr === 'number' ? link.snr : null,
+            traceroutes: link.traceroute_count ?? 0,
+            lastSeen: link.last_seen || link.timestamp || null
+        }));
+
+        if (directLinksChart) {
+            directLinksChart.config._metadata = metadata;
+            directLinksChart.data.labels = labels;
+            directLinksChart.data.datasets[0].data = distances;
+            directLinksChart.update();
+            return;
+        }
+
+        if (typeof Chart === 'undefined') {
+            console.warn('Chart.js library not available; skipping direct links chart.');
+            return;
+        }
+
+        directLinksChart = new Chart(ctx, {
+            type: 'bar',
+            data: {
+                labels,
+                datasets: [{
+                    label: 'Distance (km)',
+                    data: distances,
+                    backgroundColor: 'rgba(13, 110, 253, 0.7)',
+                    borderColor: 'rgba(13, 110, 253, 1)',
+                    borderWidth: 1
+                }]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                scales: {
+                    y: {
+                        beginAtZero: true,
+                        title: {
+                            display: true,
+                            text: 'Distance (km)'
+                        }
+                    }
+                },
+                plugins: {
+                    legend: { display: false },
+                    tooltip: {
+                        callbacks: {
+                            afterBody: (tooltipItems) => {
+                                const lines = [];
+                                tooltipItems.forEach(item => {
+                                    const meta = directLinksChart.config._metadata?.[item.dataIndex];
+                                    if (!meta) return;
+                                    if (meta.snr !== null) {
+                                        lines.push(`SNR: ${meta.snr.toFixed(2)} dB`);
+                                    }
+                                    if (typeof meta.traceroutes === 'number') {
+                                        lines.push(`Traceroutes: ${meta.traceroutes}`);
+                                    }
+                                    if (meta.lastSeen) {
+                                        lines.push(`Last seen: ${formatTimestamp(meta.lastSeen)}`);
+                                    }
+                                });
+                                return lines;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        directLinksChart.config._metadata = metadata;
+    }
+
+    function renderIndirectLinksChart(links) {
+        const canvas = document.getElementById('indirect-distance-chart');
+        const emptyState = document.getElementById('indirect-chart-empty');
+        const metaLabel = document.getElementById('indirect-chart-count');
+        if (!canvas) return;
+
+        const ctx = canvas.getContext('2d');
+        const validLinks = (links || [])
+            .filter(link => typeof link.total_distance_km === 'number' && !Number.isNaN(link.total_distance_km))
+            .sort((a, b) => (b.total_distance_km || 0) - (a.total_distance_km || 0))
+            .slice(0, 10);
+
+        if (metaLabel) {
+            metaLabel.textContent = validLinks.length ? `Top ${validLinks.length}` : 'No data';
+        }
+
+        if (validLinks.length === 0) {
+            if (indirectLinksChart) {
+                indirectLinksChart.destroy();
+                indirectLinksChart = null;
+            }
+            canvas.style.display = 'none';
+            if (emptyState) emptyState.style.display = 'block';
+            return;
+        }
+
+        canvas.style.display = 'block';
+        if (emptyState) emptyState.style.display = 'none';
+
+        const labels = validLinks.map(link => {
+            const fromHex = link.from_node_id !== null && link.from_node_id !== undefined
+                ? link.from_node_id.toString(16).padStart(8, '0')
+                : 'unknown';
+            const toHex = link.to_node_id !== null && link.to_node_id !== undefined
+                ? link.to_node_id.toString(16).padStart(8, '0')
+                : 'unknown';
+            const from = link.from_node_name || `!${fromHex}`;
+            const to = link.to_node_name || `!${toHex}`;
+            return `${from} -> ${to}`;
+        });
+        const distances = validLinks.map(link => Number(link.total_distance_km.toFixed(2)));
+        const metadata = validLinks.map(link => ({
+            hops: link.hop_count ?? 0,
+            snr: typeof link.avg_snr === 'number' ? link.avg_snr : null,
+            lastSeen: link.last_seen || null
+        }));
+
+        if (indirectLinksChart) {
+            indirectLinksChart.config._metadata = metadata;
+            indirectLinksChart.data.labels = labels;
+            indirectLinksChart.data.datasets[0].data = distances;
+            indirectLinksChart.update();
+            return;
+        }
+
+        if (typeof Chart === 'undefined') {
+            console.warn('Chart.js library not available; skipping indirect links chart.');
+            return;
+        }
+
+        indirectLinksChart = new Chart(ctx, {
+            type: 'bar',
+            data: {
+                labels,
+                datasets: [{
+                    label: 'Total Distance (km)',
+                    data: distances,
+                    backgroundColor: 'rgba(111, 66, 193, 0.7)',
+                    borderColor: 'rgba(111, 66, 193, 1)',
+                    borderWidth: 1
+                }]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                scales: {
+                    y: {
+                        beginAtZero: true,
+                        title: {
+                            display: true,
+                            text: 'Total Distance (km)'
+                        }
+                    }
+                },
+                plugins: {
+                    legend: { display: false },
+                    tooltip: {
+                        callbacks: {
+                            afterBody: (tooltipItems) => {
+                                const lines = [];
+                                tooltipItems.forEach(item => {
+                                    const meta = indirectLinksChart.config._metadata?.[item.dataIndex];
+                                    if (!meta) return;
+                                    lines.push(`Hops: ${meta.hops}`);
+                                    if (meta.snr !== null) {
+                                        lines.push(`Avg SNR: ${meta.snr.toFixed(2)} dB`);
+                                    }
+                                    if (meta.lastSeen) {
+                                        lines.push(`Last seen: ${formatTimestamp(meta.lastSeen)}`);
+                                    }
+                                });
+                                return lines;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        indirectLinksChart.config._metadata = metadata;
+    }
+
+    function formatTimestamp(timestamp) {
+        if (!timestamp) return 'Unknown';
+        if (typeof timestamp === 'number') {
+            const date = new Date(timestamp * 1000);
+            return Number.isNaN(date.getTime()) ? 'Unknown' : date.toLocaleString();
+        }
+        const date = new Date(timestamp);
+        return Number.isNaN(date.getTime()) ? String(timestamp) : date.toLocaleString();
     }
 
     function getSNRBadgeClass(snr) {
