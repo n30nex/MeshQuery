@@ -528,7 +528,7 @@ document.addEventListener('DOMContentLoaded', function() {
         endpoint: '/api/packets/data',
         enableSearch: false,
         enablePagination: true,
-        pageSize: 25,
+        pageSize: 10,  // Changed from 25 to 10 per user requirement
         deferInitialLoad: true,  // Defer loading until after URL parameters are applied
         columns: getDynamicColumns()
     });

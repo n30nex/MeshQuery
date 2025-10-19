@@ -8,7 +8,7 @@ class ModernTable {
         this.container = document.getElementById(containerId);
         this.options = {
             endpoint: options.endpoint,
-            pageSize: options.pageSize || 25,
+            pageSize: options.pageSize || 10,  // Changed default from 25 to 10
             searchDelay: options.searchDelay || 300,
             enableSearch: options.enableSearch !== false,
             enablePagination: options.enablePagination !== false,

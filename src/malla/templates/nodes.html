@@ -244,8 +244,8 @@ document.addEventListener('DOMContentLoaded', function() {
     const table = new ModernTable('nodesTable', {
         endpoint: '/api/nodes/data',
         enableSearch: false,
-        enablePagination: false,
-        pageSize: 25,
+        enablePagination: true,  // Changed from false to enable pagination
+        pageSize: 10,  // Changed from 25 to 10 per user requirement
         deferInitialLoad: true,
         defaultSort: { column: 'last_packet_str', direction: 'desc' },
         columns: [

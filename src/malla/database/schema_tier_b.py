@@ -4,8 +4,12 @@ Tier B Write-Optimized Pipeline Database Schema
 
 
 def _ensure_longest_links_materialized_views(conn, cursor):
-    """Create materialized views for longest RF distances (single-hop and multi-hop). Idempotent."""
-    # Create single-hop MV if missing
+    """Create materialized views for longest RF links (single-hop and multi-hop). Idempotent.
+    
+    Note: These views don't calculate distance_km directly since that requires lat/lon lookups.
+    Distance calculations are done in the application layer using get_longest_links_optimized().
+    """
+    # Create single-hop MV if missing - stores hop pairs with SNR and frequency
     cursor.execute("""
     DO $$
     BEGIN
@@ -14,21 +18,19 @@ def _ensure_longest_links_materialized_views(conn, cursor):
             SELECT
                 th.from_node_id,
                 th.to_node_id,
-                -- use max distance observed between the pair
-                MAX(th.distance_km) AS max_distance_km,
                 -- best (max) SNR seen in that direction over time
                 MAX(th.snr) AS best_snr,
                 COUNT(*) AS hop_count,
-                MAX(to_timestamp(th.timestamp)) AS last_seen
+                MAX(th.timestamp) AS last_seen,
+                MIN(th.timestamp) AS first_seen
             FROM traceroute_hops th
-            WHERE th.distance_km IS NOT NULL
             GROUP BY th.from_node_id, th.to_node_id;
             CREATE INDEX IF NOT EXISTS idx_singlehop_mv_pair ON longest_singlehop_mv (from_node_id, to_node_id);
-            CREATE INDEX IF NOT EXISTS idx_singlehop_mv_distance ON longest_singlehop_mv (max_distance_km DESC);
+            CREATE INDEX IF NOT EXISTS idx_singlehop_mv_count ON longest_singlehop_mv (hop_count DESC);
         END IF;
     END$$;
     """)
-    # Create multi-hop MV if missing: collapse routes into source/dest extremes and max path distance
+    # Create multi-hop MV if missing: collapse routes into source/dest extremes
     cursor.execute("""
     DO $$
     BEGIN
@@ -37,26 +39,26 @@ def _ensure_longest_links_materialized_views(conn, cursor):
             WITH hop_sets AS (
                 SELECT
                     packet_id,
-                    MIN(from_node_id) FILTER (WHERE hop_order = 0) AS source_id,
-                    MAX(to_node_id)   FILTER (WHERE hop_order = (SELECT MAX(h2.hop_order) FROM traceroute_hops h2 WHERE h2.packet_id = h.packet_id)) AS dest_id,
-                    SUM(distance_km) AS path_distance_km,
+                    MIN(from_node_id) FILTER (WHERE hop_index = 0) AS source_id,
+                    MAX(to_node_id) FILTER (WHERE hop_index = (SELECT MAX(h2.hop_index) FROM traceroute_hops h2 WHERE h2.packet_id = h.packet_id)) AS dest_id,
                     MAX(snr) AS best_snr,
-                    MAX(to_timestamp(timestamp)) AS last_seen
+                    MAX(timestamp) AS last_seen,
+                    COUNT(*) AS hop_count
                 FROM traceroute_hops h
                 GROUP BY packet_id
             )
             SELECT
                 source_id,
                 dest_id,
-                MAX(path_distance_km) AS max_path_distance_km,
                 MAX(best_snr) AS best_snr,
                 COUNT(*) AS route_count,
-                MAX(last_seen) AS last_seen
+                MAX(last_seen) AS last_seen,
+                MAX(hop_count) AS max_hops
             FROM hop_sets
             WHERE source_id IS NOT NULL AND dest_id IS NOT NULL
             GROUP BY source_id, dest_id;
             CREATE INDEX IF NOT EXISTS idx_multihop_mv_pair ON longest_multihop_mv (source_id, dest_id);
-            CREATE INDEX IF NOT EXISTS idx_multihop_mv_distance ON longest_multihop_mv (max_path_distance_km DESC);
+            CREATE INDEX IF NOT EXISTS idx_multihop_mv_count ON longest_multihop_mv (route_count DESC);
         END IF;
     END$$;
     """)
@@ -290,9 +292,9 @@ def get_longest_links_optimized(
             ll.last_seen,
             ll.first_seen
         FROM longest_links_mv ll
-        WHERE ll.avg_snr >= %s
-        AND ll.last_seen >= EXTRACT(EPOCH FROM NOW()) - (%s * 3600)
-        ORDER BY ll.traceroute_count DESC, ll.avg_snr DESC
+        WHERE (ll.avg_snr IS NULL OR ll.avg_snr >= %s)
+        AND ll.last_seen >= NOW() - MAKE_INTERVAL(hours => %s)
+        ORDER BY ll.traceroute_count DESC, ll.avg_snr DESC NULLS LAST
         LIMIT %s
         """
 
